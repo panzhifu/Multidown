@@ -17,7 +17,7 @@
 确保你已经安装了 Rust 和 Cargo。然后运行：
 
 ```bash
-git clone https://github.com/yourusername/multidown.git
+git clone https://github.com/panzhifu/Multidown.git
 cd multidown
 cargo build --release
 ```
