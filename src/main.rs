@@ -1,12 +1,12 @@
-use anyhow::Result;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use crossterm::{
+use anyhow::Result; // 用于处理错误
+use std::sync::Arc; // Arc用于跨线程共享数据
+use tokio::sync::Mutex; // Mutex用于线程安全的锁
+use crossterm::{ 
     event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode}, // 用于控制键盘输入
 };
-use std::time::Duration;
-use std::process;
+use std::time::Duration; // 用于设置定时器
+use std::process; // 用于退出程序
 
 mod cli;
 mod core;
@@ -17,22 +17,17 @@ mod config;
 #[tokio::main]
 async fn main() -> Result<()> {
     // 初始化日志
-    utils::logger::init_logger();
+    utils::logger::init_logger()?;
     
     // 解析命令行参数并加载配置
     let (args, config) = cli::Args::parse_args()?;
     
-    // url为空报错处理
-    if args.urls.is_empty() {
-        log::error!("未提供下载URL");
-        println!("请提供至少一个URL进行下载。");
-        println!("示例: cargo run -- https://example.com/file1.zip https://example.com/file2.zip");
-        process::exit(1);
-    }
-
+    // 获取URL列表
+    let urls = args.get_urls()?;
+    
     // 记录命令行参数和配置
-    log::info!("开始下载 {} 个文件", args.urls.len());
-    for (i, url) in args.urls.iter().enumerate() {
+    log::info!("开始下载 {} 个文件", urls.len());
+    for (i, url) in urls.iter().enumerate() {
         log::info!("文件 {}: {}", i + 1, url);
     }
     log::info!("配置: 并发数={}, 线程数={}, 速度限制={}MB/s, 输出目录={}",
@@ -43,7 +38,7 @@ async fn main() -> Result<()> {
     );
 
     // 创建下载任务列表
-    let tasks: Vec<core::DownloadTask> = args.urls.iter()
+    let tasks: Vec<core::DownloadTask> = urls.iter()
         .map(|url| core::DownloadTask::new(url.clone()))
         .collect();
 
@@ -61,15 +56,15 @@ async fn main() -> Result<()> {
                 if let Ok(Event::Key(key)) = event::read() {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            log::info!("用户按下 q 键，暂停下载");
-                            println!("\n正在暂停下载...");
+                            log::info!("用户按下 q 键，保存进度并退出");
+                            println!("\n正在保存进度并退出...");
                             let downloader = downloader_clone.lock().await;
                             downloader.stop().await;
                             process::exit(0);
                         },
                         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                            log::info!("用户按下 Ctrl+C，暂停下载");
-                            println!("\n正在暂停下载...");
+                            log::info!("用户按下 Ctrl+C，保存进度并退出");
+                            println!("\n正在保存进度并退出...");
                             let downloader = downloader_clone.lock().await;
                             downloader.stop().await;
                             process::exit(0);

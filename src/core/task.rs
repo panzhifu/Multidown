@@ -7,6 +7,11 @@ pub enum DownloadProtocol {
     HTTP,
     HTTPS,
     FTP,
+    // 磁力链
+    Magnet,
+    // BT种子
+    BT,
+
 }
 
 #[allow(dead_code)]
@@ -40,6 +45,8 @@ impl DownloadTask {
             "http" => DownloadProtocol::HTTP,
             "https" => DownloadProtocol::HTTPS,
             "ftp" => DownloadProtocol::FTP,
+            "magnet" => DownloadProtocol::Magnet,
+            "bt" => DownloadProtocol::BT,
             _ => DownloadProtocol::HTTP,
         };
 
