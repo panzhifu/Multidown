@@ -98,12 +98,6 @@ impl ProgressManager {
         }
     }
 
-    pub async fn update_error(&self, task_index: usize, error: &str) {
-        if let Some(pb) = self.progress_bars.lock().await.get(task_index) {
-            pb.set_message(format!("✗ 错误: {}", error));
-        }
-    }
-
     #[allow(dead_code)]
     pub async fn finish_all(&self) {
         let bars = self.progress_bars.lock().await;
