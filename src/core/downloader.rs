@@ -1,49 +1,34 @@
 use reqwest::Client;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use anyhow::{Result, Context};
-use crate::core::task::DownloadTask;
-use crate::ui::{self, ProgressManager};
+use anyhow::Result;
+use crate::core::task::{DownloadTask, TaskManager, TaskId, TaskStatus, TaskEvent, FileProgress};
+use crate::ui::ProgressManager;
 use tokio::sync::Semaphore;
-use std::sync::atomic::AtomicUsize;
-use std::time::{Instant, Duration};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use futures::StreamExt;
 use crate::config::Config;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use url::Url;
+use tokio::fs::OpenOptions as TokioOpenOptions;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-#[derive(Serialize, Deserialize, Debug)]
-struct DownloadProgress {
-    url: String,
-    downloaded_size: u64,
-    total_size: u64,
-    chunks: Vec<(u64, u64)>,  // (start, end) for each chunk
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ProgressFile {
-    tasks: HashMap<String, DownloadProgress>,
-    timestamp: i64,
-}
-
+// 结构体：Downloader
+// 下载器，负责管理下载任务和进度
 pub struct Downloader {
-    client: Client,
-    should_stop: Arc<AtomicBool>,
-    active_downloads: Arc<AtomicUsize>,
-    max_concurrent: Arc<Semaphore>,
-    progress_manager: Arc<ProgressManager>,
-    is_running: Arc<Mutex<bool>>,
-    config: Arc<Config>,
-    progress_file: String,
+    client: Client,  // HTTP 客户端
+    is_running: Arc<AtomicBool>,  // 控制下载器是否运行
+    max_concurrent: Arc<Mutex<Semaphore>>,  // 最大并发下载数
+    progress_manager: Arc<ProgressManager>,  // 进度管理器
+    config: Arc<Config>,  // 配置信息
+    chunk_size: usize,  // 分片大小
+    max_chunks: usize,  // 最大分片数
+    min_chunks: usize,
 }
 
 impl Downloader {
-    pub fn new(max_concurrent: usize) -> Self {
+    // 构造函数：创建 Downloader 实例
+    pub fn new(chunk_size: u64, max_chunks: usize) -> Self {
         let config = Config::default();
         Downloader {
             client: Client::builder()
@@ -52,260 +37,380 @@ impl Downloader {
                 .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
                 .build()
                 .unwrap_or_default(),
-            should_stop: Arc::new(AtomicBool::new(false)),
-            active_downloads: Arc::new(AtomicUsize::new(0)),
-            max_concurrent: Arc::new(Semaphore::new(max_concurrent)),
+            is_running: Arc::new(AtomicBool::new(true)),
+            max_concurrent: Arc::new(Mutex::new(Semaphore::new(10))),
             progress_manager: Arc::new(ProgressManager::new()),
-            is_running: Arc::new(Mutex::new(true)),
             config: Arc::new(config),
-            progress_file: "download_progress.json".to_string(),
+            chunk_size: chunk_size as usize,
+            max_chunks,
+            min_chunks: 1,
         }
     }
 
-    fn save_progress(&self, url: &str, downloaded: u64, total: u64) -> Result<()> {
-        let mut progress = if Path::new(&self.progress_file).exists() {
-            let content = fs::read_to_string(&self.progress_file)?;
-            serde_json::from_str(&content).unwrap_or_else(|_| ProgressFile {
-                tasks: HashMap::new(),
-                timestamp: chrono::Local::now().timestamp(),
-            })
-        } else {
-            ProgressFile {
-                tasks: HashMap::new(),
-                timestamp: chrono::Local::now().timestamp(),
-            }
-        };
-
-        progress.tasks.insert(url.to_string(), DownloadProgress {
-            url: url.to_string(),
-            downloaded_size: downloaded,
-            total_size: total,
-            chunks: vec![(0, downloaded)],
-        });
-
-        let content = serde_json::to_string_pretty(&progress)?;
-        fs::write(&self.progress_file, content)?;
-        Ok(())
-    }
-
-    fn load_progress(&self, url: &str) -> Result<Option<u64>> {
-        if !Path::new(&self.progress_file).exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(&self.progress_file)?;
-        let progress: ProgressFile = serde_json::from_str(&content)?;
-        Ok(progress.tasks.get(url).map(|p| p.downloaded_size))
-    }
-
-    pub async fn download_multiple(&self, tasks: Vec<DownloadTask>, output_dir: &str, _threads: u32) -> Result<()> {
-        let mut handles = vec![];
-        let mut success_count = 0;
-        let mut failed_count = 0;
-        let mut total_size = 0;
+    // 方法：下载多个任务
+    pub async fn download_multiple(&self, tasks: Vec<DownloadTask>, output_dir: &str) -> Result<()> {
+        let mut all_handles = vec![];
+        let progress_manager = self.progress_manager.clone();
         
-        for (index, task) in tasks.into_iter().enumerate() {
-            if self.should_stop.load(Ordering::SeqCst) {
+        // 为每个任务创建任务管理
+        for (task_index, task) in tasks.iter().enumerate() {
+            if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
-
-            let output_path = output_dir.to_string();
-            let downloader = Arc::new(self.clone());
-            let active_downloads = Arc::clone(&self.active_downloads);
-            let max_concurrent = Arc::clone(&self.max_concurrent);
-            let progress_manager = Arc::clone(&self.progress_manager);
-
-            progress_manager.add_task(&task).await;
-
-            let handle = tokio::spawn(async move {
-                let _permit = max_concurrent.acquire().await?;
-                active_downloads.fetch_add(1, Ordering::SeqCst);
-
-                let result = downloader.download_with_retry(&task, &output_path).await;
-
-                active_downloads.fetch_sub(1, Ordering::SeqCst);
+            
+            // 为每个任务创建一个事件通道
+            let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
+            
+            // 为每个任务创建一个任务管理器
+            let task_manager = TaskManager::new();
+            let task_id = task_manager.add_task(task.urls.clone(), Some(event_sender)).await;
+            
+            // 为任务中的每个URL创建独立的下载任务
+            for (url_index, url) in task.urls.iter().enumerate() {
+                let filename = TaskManager::get_filename_from_url(url);
+                let output_file = Path::new(output_dir).join(&filename);
+                let output_file_str = output_file.to_str().unwrap_or("");
                 
-                let success = result.is_ok();
-                progress_manager.finish_task(index, success).await;
+                // 注册进度条，获取索引
+                let pb_index = progress_manager.add_progress_bar(0, &filename).await;
                 
-                result
-            });
-
-            handles.push((index, handle));
-        }
-
-        for (index, handle) in handles {
-            match handle.await? {
-                Ok(size) => {
-                    success_count += 1;
-                    total_size += size;
-                    self.progress_manager.finish_task(index, true).await;
-                }
-                Err(e) => {
-                    failed_count += 1;
-                    log::error!("下载任务失败: {}", e);
-                    self.progress_manager.finish_task(index, false).await;
-                }
+                // 克隆必要的字段用于异步任务
+                let downloader = self.clone();
+                let url = url.clone();
+                let file_path = output_file_str.to_string();
+                let task_manager = task_manager.clone();
+                let task_id = task_id.clone();
+                let progress_manager = progress_manager.clone();
+                
+                // 为每个URL创建独立的下载任务
+                let handle = tokio::spawn(async move {
+                    // 下载单个文件，传递全局进度管理器和进度条索引
+                    downloader.download_file(&url, &file_path, pb_index, progress_manager, task_manager, task_id).await
+                });
+                
+                all_handles.push(handle);
             }
         }
+        
+        // 等待所有下载任务完成
+        for handle in all_handles {
+            handle.await??;
+        }
+        
+        Ok(())
+    }
 
-        let summary = ui::DownloadSummary {
-            total_files: success_count + failed_count,
-            total_size,
-            elapsed_time: self.progress_manager.elapsed_time(),
-            success_count,
-            failed_count,
-        };
-        println!("{}", summary);
+    // 方法：停止下载
+    pub async fn stop(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
+    }
+
+    // 统一的下载方法 - 使用TaskManager进行任务管理
+    pub async fn download_file(
+        &self, 
+        url: &str, 
+        file: &str, 
+        task_index: usize, 
+        progress_manager: Arc<ProgressManager>,
+        task_manager: TaskManager,
+        task_id: TaskId
+    ) -> Result<()> {
+        // 更新任务状态为运行中
+        task_manager.update_task_status(&task_id, TaskStatus::Running).await;
+
+        let response = self.client.head(url).send().await?;
+        let total_size = response.content_length().unwrap_or(0);
+        let supports_range = response.headers().get("accept-ranges").map_or(false, |v| v == "bytes");
+
+        if total_size > 10 * 1024 * 1024 && supports_range {
+            // 大文件且支持 Range，使用分片多线程下载
+            self.download_chunked(url, file, total_size, task_index, progress_manager, task_manager.clone(), task_id.clone()).await?;
+        } else {
+            // 小文件或不支持 Range，使用顺序下载
+            self.download_sequential(url, file, total_size, task_index, progress_manager, task_manager.clone(), task_id.clone()).await?;
+        }
+
+        // 更新任务状态为完成
+        task_manager.update_task_status(&task_id, TaskStatus::Completed).await;
 
         Ok(())
     }
 
-    async fn download_with_retry(&self, task: &DownloadTask, output_dir: &str) -> Result<u64> {
-        let mut retries = 0;
-        let mut last_error = None;
+    // 统一的分片下载方法
+    async fn download_chunked(
+        &self, 
+        url: &str, 
+        file: &str, 
+        total_size: u64, 
+        task_index: usize, 
+        progress_manager: Arc<ProgressManager>,
+        task_manager: TaskManager,
+        task_id: TaskId
+    ) -> Result<()> {
+        // 检查是否有进度文件，实现断点续传
+        let progress_path = format!("{}.progress", file);
+        let progress = if std::path::Path::new(&progress_path).exists() {
+            match FileProgress::load_from_file(&progress_path).await {
+                Ok(p) => {
+                    println!("发现进度文件，恢复下载: {}", file);
+                    p
+                }
+                Err(_) => {
+                    println!("进度文件损坏，重新开始下载: {}", file);
+                    FileProgress::new(url, file, total_size, self.chunk_size as u64)
+                }
+            }
+        } else {
+            FileProgress::new(url, file, total_size, self.chunk_size as u64)
+        };
 
-        while retries < self.config.retry_count as u32 {
-            match self.download(task, output_dir).await {
-                Ok(size) => return Ok(size),
-                Err(e) => {
-                    last_error = Some(e);
-                    retries += 1;
-                    if retries < self.config.retry_count as u32 {
-                        log::error!("下载失败，正在重试 ({}/{})", retries, self.config.retry_count);
-                        tokio::time::sleep(Duration::from_secs(self.config.retry_delay)).await;
+        let progress_arc = Arc::new(Mutex::new(progress.clone()));
+        let max_retry = 3;
+        let url_speed_history = Arc::new(Mutex::new(Vec::new()));
+        let speed_check_interval = Duration::from_secs(2);
+        let high_speed_threshold = 1024 * 1024; // 1MB/s
+        let low_speed_threshold = 100 * 1024;   // 100KB/s
+        let progress_arc_for_speed = progress_arc.clone();
+
+        // 动态调整分片数的监控任务
+        let speed_history_for_adjust = url_speed_history.clone();
+        let task_manager_for_adjust = task_manager.clone();
+        let adjust_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(speed_check_interval).await;
+                let history = speed_history_for_adjust.lock().await;
+                if history.is_empty() { continue; }
+                let avg_speed: u64 = history.iter().sum::<u64>() / history.len() as u64;
+                if avg_speed > high_speed_threshold {
+                    task_manager_for_adjust.increase_chunks();
+                } else if avg_speed < low_speed_threshold {
+                    task_manager_for_adjust.decrease_chunks();
+                }
+                // 任务全部完成时退出
+                let progress = progress_arc_for_speed.lock().await;
+                if !progress.has_incomplete_chunks() { break; }
+            }
+        });
+
+        // 分片下载主循环
+        let mut chunk_indices: Vec<_> = progress.chunks.iter().filter(|c| !c.downloaded).map(|c| c.index).collect();
+        while !chunk_indices.is_empty() {
+            let cur_chunks = task_manager.get_current_chunks();
+            let batch: Vec<_> = chunk_indices.drain(..cur_chunks.min(chunk_indices.len())).collect();
+            let mut batch_handles = vec![];
+            for chunk_idx in batch {
+                let chunk = progress.chunks[chunk_idx].clone();
+                // 检查任务状态
+                if let Some(is_cancelled) = task_manager.is_task_cancelled(&task_id).await {
+                    if is_cancelled {
+                        return Err(anyhow::anyhow!("Task cancelled"));
+                    }
+                }
+                
+                if let Some(is_paused) = task_manager.is_task_paused(&task_id).await {
+                    if is_paused {
+                        // 等待恢复
+                        while task_manager.is_task_paused(&task_id).await.unwrap_or(false) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            if task_manager.is_task_cancelled(&task_id).await.unwrap_or(false) {
+                                return Err(anyhow::anyhow!("Task cancelled while paused"));
+                            }
+                        }
+                    }
+                }
+
+                if !self.is_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                
+                // 获取并发许可
+                {
+                    let semaphore = self.max_concurrent.lock().await;
+                    let _permit = semaphore.acquire().await?;
+                }
+                
+                let client = self.client.clone();
+                let progress_arc = progress_arc.clone();
+                let speed_history = url_speed_history.clone();
+                let url = url.to_string();
+                let file_path = file.to_string();
+                let progress_manager = progress_manager.clone();
+                let task_manager = task_manager.clone();
+                let task_id = task_id.clone();
+                let progress_path = progress_path.clone();
+                let total_size = total_size;
+                let task_index = task_index;
+                let max_retry = max_retry;
+                let handle = tokio::spawn(async move {
+                    let mut retry = 0;
+                    loop {
+                        if let Some(is_cancelled) = task_manager.is_task_cancelled(&task_id).await {
+                            if is_cancelled {
+                                break Err(anyhow::anyhow!("Task cancelled"));
+                            }
+                        }
+                        let start_time = std::time::Instant::now();
+                        let range = format!("bytes={}-{}", chunk.start, chunk.end);
+                        let resp = client.get(&url).header("Range", range).send().await;
+                        match resp {
+                            Ok(resp) => {
+                                let bytes = resp.bytes().await?;
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                let speed = if elapsed > 0.0 { (bytes.len() as f64 / elapsed) as u64 } else { bytes.len() as u64 };
+                                {
+                                    let mut history = speed_history.lock().await;
+                                    history.push(speed);
+                                    if history.len() > 10 { history.remove(0); }
+                                }
+                                let mut file = TokioOpenOptions::new().create(true).write(true).open(&file_path).await?;
+                                file.seek(SeekFrom::Start(chunk.start)).await?;
+                                file.write_all(&bytes).await?;
+                                let mut progress = progress_arc.lock().await;
+                                if let Some(c) = progress.chunks.iter_mut().find(|c| c.index == chunk.index) {
+                                    c.downloaded = true;
+                                    c.retry_count = retry;
+                                    c.last_speed = Some(speed);
+                                }
+                                if let Err(e) = progress.save_to_file(&progress_path).await {
+                                    eprintln!("保存进度文件失败: {}", e);
+                                }
+                                let downloaded_chunks = progress.chunks.iter().filter(|c| c.downloaded).count();
+                                let downloaded_size = downloaded_chunks as u64 * chunk.size();
+                                let progress_percent = (downloaded_size as f32 / total_size as f32) * 100.0;
+                                task_manager.update_task_progress(&task_id, progress_percent, speed, total_size).await;
+                                progress_manager.update_progress(task_index, downloaded_size, total_size, speed).await;
+                                break Ok::<(), anyhow::Error>(());
+                            }
+                            Err(_) if retry < max_retry => {
+                                retry += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                let mut progress = progress_arc.lock().await;
+                                if let Some(c) = progress.chunks.iter_mut().find(|c| c.index == chunk.index) {
+                                    c.retry_count = retry;
+                                    c.last_speed = None;
+                                }
+                                if let Err(save_err) = progress.save_to_file(&progress_path).await {
+                                    eprintln!("保存进度文件失败: {}", save_err);
+                                }
+                                task_manager.update_task_status(&task_id, TaskStatus::Failed(e.to_string())).await;
+                                break Err(anyhow::anyhow!("Chunk {} failed after {} retries: {}", chunk.index, retry, e));
+                            }
+                        }
+                    }
+                });
+                batch_handles.push(handle);
+            }
+            for h in batch_handles {
+                h.await??;
+            }
+        }
+        // 等待动态调整分片数的监控任务结束
+        adjust_handle.await.ok();
+        // 下载完成后删除进度文件
+        if let Err(e) = tokio::fs::remove_file(&progress_path).await {
+            eprintln!("删除进度文件失败: {}", e);
+        }
+        Ok(())
+    }
+
+    // 统一的顺序下载方法
+    async fn download_sequential(
+        &self, 
+        url: &str, 
+        file: &str, 
+        total_size: u64, 
+        task_index: usize, 
+        progress_manager: Arc<ProgressManager>,
+        task_manager: TaskManager,
+        task_id: TaskId
+    ) -> Result<()> {
+        // 检查是否有进度文件，实现断点续传
+        let progress_path = format!("{}.progress", file);
+        let mut downloaded = 0;
+        
+        // 如果存在进度文件，尝试恢复下载位置
+        if std::path::Path::new(&progress_path).exists() {
+            if let Ok(progress) = FileProgress::load_from_file(&progress_path).await {
+                downloaded = progress.get_downloaded_bytes();
+                println!("发现进度文件，从位置 {} 恢复下载: {}", downloaded, file);
+            }
+        }
+        
+        let mut file_handle = TaskManager::create_file(file).await?;
+        
+        // 如果有已下载的部分，设置文件指针位置
+        if downloaded > 0 {
+            file_handle.seek(SeekFrom::Start(downloaded)).await?;
+        }
+        
+        let response = self.client.get(url).send().await?;
+        let mut stream = response.bytes_stream();
+        
+        while let Some(chunk) = stream.next().await {
+            // 检查任务状态
+            if let Some(is_cancelled) = task_manager.is_task_cancelled(&task_id).await {
+                if is_cancelled {
+                    return Err(anyhow::anyhow!("Task cancelled"));
+                }
+            }
+            
+            if let Some(is_paused) = task_manager.is_task_paused(&task_id).await {
+                if is_paused {
+                    // 等待恢复
+                    while task_manager.is_task_paused(&task_id).await.unwrap_or(false) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if task_manager.is_task_cancelled(&task_id).await.unwrap_or(false) {
+                            return Err(anyhow::anyhow!("Task cancelled while paused"));
+                        }
                     }
                 }
             }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("下载失败")))
-    }
-
-    pub async fn download(&self, task: &DownloadTask, output_dir: &str) -> Result<u64> {
-        log::info!("开始下载: {}", task.url);
-        
-        // 处理GitHub下载链接
-        let url = if task.url.contains("github.com") {
-            self.process_github_url(&task.url)?
-        } else {
-            task.url.clone()
-        };
-
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("创建输出目录失败: {}", output_dir))?;
-
-        let filename = Self::get_filename_from_url(&url);
-        let output_file = Path::new(output_dir).join(&filename);
-        
-        log::info!("文件将保存到: {}", output_file.display());
-
-        let mut downloaded = self.load_progress(&url)?.unwrap_or(0);
-        let mut file = if downloaded > 0 {
-            log::info!("发现已下载的部分: {} 字节", downloaded);
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&output_file)?
-        } else {
-            File::create(&output_file)?
-        };
-
-        let response = self.client.head(&url).send().await?;
-        let total_size = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if downloaded >= total_size {
-            log::info!("文件已完整下载: {}", filename);
-            return Ok(downloaded);
-        }
-
-        let mut request = self.client.get(&url);
-        if downloaded > 0 {
-            request = request.header("Range", format!("bytes={}-", downloaded));
-        }
-
-        let response = request.send().await?;
-        let status = response.status();
-
-        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(anyhow::anyhow!("下载失败: HTTP {}", status));
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut last_update = Instant::now();
-        let mut last_downloaded = downloaded;
-
-        while let Some(chunk) = stream.next().await {
-            if self.should_stop.load(Ordering::SeqCst) {
-                self.save_progress(&url, downloaded, total_size)?;
-                return Err(anyhow::anyhow!("下载被用户中断"));
+            
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
             }
-
+            
             let chunk = chunk?;
-            file.write_all(&chunk)?;
+            file_handle.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-
-            let now = Instant::now();
-            if now.duration_since(last_update) >= Duration::from_secs(1) {
-                let speed = (downloaded - last_downloaded) / now.duration_since(last_update).as_secs();
-                self.progress_manager.update_progress(0, downloaded, total_size, speed).await;
-                last_update = now;
-                last_downloaded = downloaded;
+            
+            // 保存进度到文件，实现断点续传
+            let progress = FileProgress::new(url, file, total_size, total_size); // file参数应为路径字符串
+            if let Err(e) = progress.save_to_file(&progress_path).await {
+                eprintln!("保存进度文件失败: {}", e);
             }
+            
+            // 更新任务进度
+            let progress_percent = (downloaded as f32 / total_size as f32) * 100.0;
+            task_manager.update_task_progress(&task_id, progress_percent, 0, total_size).await;
+            
+            // 更新URL级别的进度
+            progress_manager.update_progress(task_index, downloaded, total_size, 0).await;
         }
-
-        if downloaded >= total_size {
-            if Path::new(&self.progress_file).exists() {
-                fs::remove_file(&self.progress_file)?;
-            }
+        
+        // 下载完成后删除进度文件
+        if let Err(e) = tokio::fs::remove_file(&progress_path).await {
+            eprintln!("删除进度文件失败: {}", e);
         }
-
-        Ok(downloaded)
-    }
-
-    fn process_github_url(&self, url: &str) -> Result<String> {
-        let parsed_url = Url::parse(url)?;
-        if parsed_url.host_str().unwrap_or("").contains("github.com") {
-            // 如果是GitHub下载链接，尝试使用镜像
-            if let Some(path) = parsed_url.path().strip_prefix("/") {
-                let mirror_url = format!("https://ghproxy.com/https://github.com/{}", path);
-                log::info!("使用GitHub镜像: {}", mirror_url);
-                return Ok(mirror_url);
-            }
-        }
-        Ok(url.to_string())
-    }
-
-    pub async fn stop(&self) {
-        let mut is_running = self.is_running.lock().await;
-        *is_running = false;
-        self.should_stop.store(true, Ordering::SeqCst);
-    }
-
-    fn get_filename_from_url(url: &str) -> String {
-        url.split('/')
-            .last()
-            .unwrap_or("downloaded_file")
-            .to_string()
+        
+        Ok(())
     }
 }
 
 impl Clone for Downloader {
+    // 实现 Clone trait，用于克隆 Downloader 实例
     fn clone(&self) -> Self {
         Downloader {
             client: self.client.clone(),
-            should_stop: Arc::clone(&self.should_stop),
-            active_downloads: Arc::clone(&self.active_downloads),
+            is_running: Arc::clone(&self.is_running),
             max_concurrent: Arc::clone(&self.max_concurrent),
             progress_manager: Arc::clone(&self.progress_manager),
-            is_running: Arc::clone(&self.is_running),
             config: Arc::clone(&self.config),
-            progress_file: self.progress_file.clone(),
+            chunk_size: self.chunk_size,
+            max_chunks: self.max_chunks,
+            min_chunks: self.min_chunks,
         }
     }
 } 

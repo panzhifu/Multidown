@@ -1,43 +1,34 @@
-use std::time::{Duration, Instant};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+// use std::time::{Duration, Instant};
+// use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+// use crate::core::task::DownloadTask;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::core::task::DownloadTask;
+use indicatif::ProgressBar;
 
+// 结构体：ProgressManager
+// 用于管理下载进度条
 pub struct ProgressManager {
-    multi_progress: Arc<Mutex<MultiProgress>>,
-    progress_bars: Arc<Mutex<Vec<ProgressBar>>>,
-    start_time: Instant,
+    progress_bars: Arc<Mutex<Vec<ProgressBar>>>,  // 使用 Arc<Mutex<Vec<ProgressBar>>> 存储进度条列表
 }
 
 impl ProgressManager {
+    // 构造函数：创建 ProgressManager 实例
     pub fn new() -> Self {
         ProgressManager {
-            multi_progress: Arc::new(Mutex::new(MultiProgress::new())),
             progress_bars: Arc::new(Mutex::new(Vec::new())),
-            start_time: Instant::now(),
         }
     }
 
-    pub async fn add_task(&self, task: &DownloadTask) {
-        let pb = ProgressBar::new(100);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
-                .unwrap()
-                .progress_chars("█▓▒░")
-        );
-
-        // 设置文件名显示
-        let filename = task.url.split('/').last().unwrap_or("未知文件");
-        pb.set_message(format!("下载: {}", filename));
-
+    // 新增：添加进度条，返回索引
+    pub async fn add_progress_bar(&self, total: u64, msg: &str) -> usize {
+        let pb = ProgressBar::new(total);
+        pb.set_message(msg.to_string());
         let mut bars = self.progress_bars.lock().await;
-        let multi = self.multi_progress.lock().await;
-        multi.add(pb.clone());
         bars.push(pb);
+        bars.len() - 1
     }
 
+    // 方法：更新下载进度
     pub async fn update_progress(&self, task_index: usize, downloaded: u64, total: u64, speed: u64) {
         if let Some(pb) = self.progress_bars.lock().await.get(task_index) {
             // 设置进度条长度
@@ -87,45 +78,4 @@ impl ProgressManager {
             pb.set_message(status);
         }
     }
-
-    pub async fn finish_task(&self, task_index: usize, success: bool) {
-        if let Some(pb) = self.progress_bars.lock().await.get(task_index) {
-            if success {
-                pb.finish_with_message("✓ 下载完成");
-            } else {
-                pb.finish_with_message("✗ 下载失败");
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn finish_all(&self) {
-        let bars = self.progress_bars.lock().await;
-        for pb in bars.iter() {
-            pb.finish_and_clear();
-        }
-    }
-
-    pub fn elapsed_time(&self) -> Duration {
-        self.start_time.elapsed()
-    }
-
-    #[allow(dead_code)]
-    pub fn format_size(size: u64) -> String {
-        const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-        let mut size = size as f64;
-        let mut unit_index = 0;
-
-        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-            size /= 1024.0;
-            unit_index += 1;
-        }
-
-        format!("{:.2} {}", size, UNITS[unit_index])
-    }
-}
-
-#[allow(dead_code)]
-impl ProgressManager {
-    // ... existing code ...
 } 
