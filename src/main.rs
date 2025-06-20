@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
         .collect();
 
     // 创建下载器实例，使用配置的并发数
-    let downloader = Arc::new(Mutex::new(core::Downloader::new(config.max_concurrent_downloads))); 
+    let downloader = Arc::new(Mutex::new(core::Downloader::new(
+        config.chunk_size as u64,
+        config.max_concurrent_downloads
+    )));
     
     // 启用原始模式以捕获键盘事件
     enable_raw_mode()?;
@@ -79,8 +82,7 @@ async fn main() -> Result<()> {
     let downloader = downloader.lock().await;
     let download_result = downloader.download_multiple(
         tasks,
-        &config.default_output_dir,
-        config.default_threads as u32
+        &config.default_output_dir
     ).await;
     
     // 禁用原始模式
