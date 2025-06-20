@@ -21,6 +21,8 @@ bytes = "1.0"
 url = "2.5"
 clap = { version = "4.0", features = ["derive"] }
 toml = "0.7"
+actix = "0.13"
+actix-rt = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
