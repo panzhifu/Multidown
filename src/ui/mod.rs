@@ -1,7 +1,70 @@
-mod progress;
-
+use actix::prelude::*;
 use std::fmt;
-pub use progress::ProgressManager;
+use std::time::Duration;
+use std::collections::HashSet;
+
+mod progress;
+use progress::ProgressManager;
+
+// UI展示Actor
+pub struct UiActor {
+    progress: ProgressManager,
+    known_tasks: HashSet<String>,
+}
+
+impl UiActor {
+    pub fn new() -> Self {
+        UiActor {
+            progress: ProgressManager::new(),
+            known_tasks: HashSet::new(),
+        }
+    }
+}
+
+impl Actor for UiActor {
+    type Context = Context<Self>;
+}
+
+// 进度更新消息
+pub struct UpdateProgressMsg {
+    pub task_id: String,
+    pub progress: f32,
+    pub speed: u64,
+    pub size: u64,
+}
+impl Message for UpdateProgressMsg {
+    type Result = ();
+}
+
+// 下载汇总消息
+pub struct ShowSummaryMsg {
+    pub summary: DownloadSummary,
+}
+impl Message for ShowSummaryMsg {
+    type Result = ();
+}
+
+// 进度更新处理
+impl Handler<UpdateProgressMsg> for UiActor {
+    type Result = ();
+    fn handle(&mut self, msg: UpdateProgressMsg, _ctx: &mut Self::Context) {
+        if !self.known_tasks.contains(&msg.task_id) {
+            self.progress.add_progress_bar(&msg.task_id, msg.size, &format!("任务 {}", msg.task_id));
+            self.known_tasks.insert(msg.task_id.clone());
+        }
+        let downloaded = (msg.progress * msg.size as f32 / 100.0) as u64;
+        let file_name = format!("任务 {}", msg.task_id);
+        self.progress.update_progress(&msg.task_id, downloaded, msg.size, msg.speed, &file_name);
+    }
+}
+
+// 汇总展示处理
+impl Handler<ShowSummaryMsg> for UiActor {
+    type Result = ();
+    fn handle(&mut self, msg: ShowSummaryMsg, _ctx: &mut Self::Context) {
+        println!("{}", msg.summary);
+    }
+}
 
 pub fn print_success(message: &str) {
     println!("✓ {}", message);
@@ -22,7 +85,7 @@ pub fn print_error(message: &str) {
 pub struct DownloadSummary {
     pub total_files: usize,
     pub total_size: u64,
-    pub elapsed_time: std::time::Duration,
+    pub elapsed_time: Duration,
     pub success_count: usize,
     pub failed_count: usize,
 }

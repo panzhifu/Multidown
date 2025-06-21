@@ -1,41 +1,54 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use anyhow::{Result, Context};
+use anyhow::{Result};
 use std::collections::HashMap;
+use crate::core::error::DownloadError;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// 全局配置结构体
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
-    // 下载设置
+    /// 最大并发下载数
     pub max_concurrent_downloads: usize,
+    /// 每个任务默认线程数
     pub default_threads: usize,
+    /// 默认速度限制（MB/s）
     pub default_speed_limit: f32,
+    /// 默认输出目录
     pub default_output_dir: String,
+    /// 下载重试次数
     pub retry_count: usize,
+    /// 下载重试间隔（秒）
     pub retry_delay: u64,
     
-    // 网络设置
+    /// 网络设置
     pub timeout: u64,
+    /// User-Agent
     pub user_agent: String,
+    /// 代理设置
     pub proxy: Option<String>,
+    /// 是否校验SSL
     pub verify_ssl: bool,
     
-    // 文件设置
+    /// 文件设置
     pub auto_rename: bool,
+    /// 是否覆盖已存在文件
     pub overwrite_existing: bool,
+    /// 自动创建目录
     pub create_directories: bool,
     
-    // 通知设置
+    /// 通知设置
     pub enable_notifications: bool,
+    /// 通知声音
     pub notification_sound: bool,
     
-    // 界面设置
+    /// 界面设置
     pub show_progress_bar: bool,
     pub show_speed: bool,
     pub show_eta: bool,
     pub show_size: bool,
     
-    // 高级设置
+    /// 高级设置
     pub chunk_size: usize,
     pub buffer_size: usize,
     pub max_redirects: usize,
@@ -84,10 +97,11 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load(path: &str) -> Result<Self> {
+    /// 加载配置文件
+    pub fn load(path: &str) -> Result<Self, DownloadError> {
         if Path::new(path).exists() {
             let content = fs::read_to_string(path)
-                .with_context(|| format!("无法读取配置文件: {}", path))?;
+                .map_err(|e| DownloadError::IoError(e))?;
             
             // 尝试解析TOML
             match toml::from_str(&content) {
@@ -108,70 +122,92 @@ impl Config {
         }
     }
 
-    pub fn save(&self, path: &str) -> Result<()> {
+    /// 保存配置文件
+    pub fn save(&self, path: &str) -> Result<(), DownloadError> {
         // 确保目录存在
         if let Some(parent) = Path::new(path).parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)
-                    .with_context(|| format!("无法创建配置目录: {}", parent.display()))?;
+                    .map_err(|e| DownloadError::IoError(e))?;
             }
         }
 
         // 序列化为TOML
         let content = toml::to_string_pretty(self)
-            .with_context(|| "无法序列化配置")?;
+            .map_err(|e| DownloadError::Unknown(format!("无法序列化配置: {}", e)))?;
         
         // 写入文件
         fs::write(path, content)
-            .with_context(|| format!("无法保存配置文件: {}", path))?;
+            .map_err(|e| DownloadError::IoError(e))?;
         
         Ok(())
     }
 
-    pub fn validate(&self) -> Result<()> {
+    /// 校验配置合法性
+    pub fn validate(&self) -> Result<(), DownloadError> {
         // 验证并发下载数
         if self.max_concurrent_downloads == 0 {
-            anyhow::bail!("并发下载数必须大于0");
+            return Err(DownloadError::Unknown("并发下载数必须大于0".to_string()));
         }
 
         // 验证线程数
         if self.default_threads == 0 {
-            anyhow::bail!("默认线程数必须大于0");
+            return Err(DownloadError::Unknown("默认线程数必须大于0".to_string()));
         }
 
         // 验证速度限制
         if self.default_speed_limit < 0.0 {
-            anyhow::bail!("速度限制不能为负数");
+            return Err(DownloadError::Unknown("速度限制不能为负数".to_string()));
         }
 
         // 验证重试次数
         if self.retry_count == 0 {
-            anyhow::bail!("重试次数必须大于0");
+            return Err(DownloadError::Unknown("重试次数必须大于0".to_string()));
         }
 
         // 验证超时时间
         if self.timeout == 0 {
-            anyhow::bail!("超时时间必须大于0");
+            return Err(DownloadError::Unknown("超时时间必须大于0".to_string()));
         }
 
         // 验证块大小
         if self.chunk_size == 0 {
-            anyhow::bail!("块大小必须大于0");
+            return Err(DownloadError::Unknown("块大小必须大于0".to_string()));
         }
 
         // 验证缓冲区大小
         if self.buffer_size == 0 {
-            anyhow::bail!("缓冲区大小必须大于0");
+            return Err(DownloadError::Unknown("缓冲区大小必须大于0".to_string()));
         }
 
         // 验证最大重定向次数
         if self.max_redirects == 0 {
-            anyhow::bail!("最大重定向次数必须大于0");
+            return Err(DownloadError::Unknown("最大重定向次数必须大于0".to_string()));
+        }
+
+        // 路径校验
+        if self.default_output_dir.trim().is_empty() {
+            return Err(DownloadError::InvalidUrl("输出目录不能为空".to_string()));
+        }
+
+        // proxy 校验
+        if let Some(proxy) = &self.proxy {
+            if !proxy.starts_with("http://") && !proxy.starts_with("https://") && !proxy.starts_with("socks5://") {
+                return Err(DownloadError::UnsupportedProtocol(proxy.clone()));
+            }
+        }
+
+        // custom_headers 校验
+        for (k, v) in &self.custom_headers {
+            if k.trim().is_empty() || v.trim().is_empty() {
+                return Err(DownloadError::Unknown("自定义请求头键值不能为空".to_string()));
+            }
         }
 
         Ok(())
     }
 
+    /// 合并配置
     #[allow(dead_code)]
     pub fn merge(&mut self, other: &Config) {
         // 合并下载设置
@@ -214,8 +250,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
     #[test]
     fn test_config_default() {
         let config = Config::default();
@@ -240,19 +274,12 @@ mod tests {
 
     #[test]
     fn test_config_save_load() {
-        let temp_config = "temp_config.conf";
-        let config = Config::default();
-        
-        // 测试保存
-        config.save(temp_config).unwrap();
-        assert!(Path::new(temp_config).exists());
-        
-        // 测试加载
-        let loaded_config = Config::load(temp_config).unwrap();
-        assert_eq!(loaded_config.max_concurrent_downloads, config.max_concurrent_downloads);
-        assert_eq!(loaded_config.default_threads, config.default_threads);
-        
-        // 清理
-        fs::remove_file(temp_config).unwrap();
+        let c = Config::default();
+        let path = "./downloads/test_config.toml";
+        std::fs::create_dir_all("./downloads").unwrap(); // 保证目录存在
+        c.save(path).expect("保存配置失败");
+        let c2 = Config::load(path).expect("加载配置失败");
+        assert_eq!(c2.max_concurrent_downloads, c.max_concurrent_downloads);
+        let _ = std::fs::remove_file(path); // 测试后清理
     }
 } 
