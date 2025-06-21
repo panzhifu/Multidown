@@ -1,8 +1,7 @@
 use chrono::Local; // 用于获取本地时间
-
 use log::LevelFilter; // 用于设置日志级别
 use std::io::Write; // 用于写入日志
-use std::fs::{File};
+use std::fs::File;
 use actix::prelude::*;
 
 // ========== actix 日志Actor ==========
@@ -51,7 +50,7 @@ impl Handler<SetLogLevelMsg> for LoggerActor {
 
 // ========== 兼容原有同步日志初始化 ==========
 
-// 设置日志级别
+/// 设置日志级别
 #[allow(dead_code)]
 pub fn set_log_level(level: LevelFilter) {
     log::set_max_level(level); // 设置日志级别

@@ -8,7 +8,7 @@ use std::path::Path;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "multidown",
-    author = "MultiDown Team",
+    author = "panzhifu",
     version = env!("CARGO_PKG_VERSION"),
     about = "一个用 Rust 编写的多线程下载管理器",
     long_about = "支持并发下载、断点续传、动态分片调整和实时进度显示的多线程下载管理器"
@@ -25,6 +25,69 @@ pub struct Args {
     /// 配置文件路径
     #[arg(short, long, default_value = "./multidown.conf")]
     pub config: String,
+
+    // ========== 可覆盖 Config 的参数 ==========
+    #[arg(long)]
+    pub max_concurrent_downloads: Option<usize>,
+    #[arg(long)]
+    pub default_threads: Option<usize>,
+    #[arg(long)]
+    pub default_speed_limit: Option<f32>,
+    #[arg(long)]
+    pub output_dir: Option<String>,
+    #[arg(long)]
+    pub retry_count: Option<usize>,
+    #[arg(long)]
+    pub retry_delay: Option<u64>,
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    #[arg(long)]
+    pub user_agent: Option<String>,
+    #[arg(long)]
+    pub proxy: Option<String>,
+    #[arg(long)]
+    pub verify_ssl: Option<bool>,
+    #[arg(long)]
+    pub auto_rename: Option<bool>,
+    #[arg(long)]
+    pub overwrite_existing: Option<bool>,
+    #[arg(long)]
+    pub create_directories: Option<bool>,
+    #[arg(long)]
+    pub enable_notifications: Option<bool>,
+    #[arg(long)]
+    pub notification_sound: Option<bool>,
+    #[arg(long)]
+    pub show_progress_bar: Option<bool>,
+    #[arg(long)]
+    pub show_speed: Option<bool>,
+    #[arg(long)]
+    pub show_eta: Option<bool>,
+    #[arg(long)]
+    pub show_size: Option<bool>,
+    #[arg(long)]
+    pub chunk_size: Option<usize>,
+    #[arg(long)]
+    pub buffer_size: Option<usize>,
+    #[arg(long)]
+    pub max_redirects: Option<usize>,
+    #[arg(long)]
+    pub enable_chunked_download: Option<bool>,
+    #[arg(long)]
+    pub max_chunks_per_file: Option<usize>,
+    #[arg(long)]
+    pub min_chunk_size: Option<usize>,
+    #[arg(long)]
+    pub chunk_timeout: Option<u64>,
+    #[arg(long)]
+    pub enable_resume: Option<bool>,
+    #[arg(long)]
+    pub resume_check_interval: Option<u64>,
+    #[arg(long)]
+    pub auto_resume_on_startup: Option<bool>,
+    /// 下载速度限制（KB/s），0 表示不限速
+    #[arg(long)]
+    pub speed_limit_kb: Option<u64>,
 }
 
 impl Args {
@@ -51,18 +114,55 @@ impl Args {
         }
     }
 
+    /// 合并命令行参数到配置
+    pub fn merge_into_config(&self, config: &mut Config) {
+        if let Some(v) = self.max_concurrent_downloads { config.max_concurrent_downloads = v; }
+        if let Some(v) = self.default_threads { config.default_threads = v; }
+        if let Some(v) = self.default_speed_limit { config.default_speed_limit = v; }
+        if let Some(ref v) = self.output_dir { config.default_output_dir = v.clone(); }
+        if let Some(v) = self.retry_count { config.retry_count = v; }
+        if let Some(v) = self.retry_delay { config.retry_delay = v; }
+        if let Some(v) = self.timeout { config.timeout = v; }
+        if let Some(ref v) = self.user_agent { config.user_agent = v.clone(); }
+        if let Some(ref v) = self.proxy { config.proxy = Some(v.clone()); }
+        if let Some(v) = self.verify_ssl { config.verify_ssl = v; }
+        if let Some(v) = self.auto_rename { config.auto_rename = v; }
+        if let Some(v) = self.overwrite_existing { config.overwrite_existing = v; }
+        if let Some(v) = self.create_directories { config.create_directories = v; }
+        if let Some(v) = self.enable_notifications { config.enable_notifications = v; }
+        if let Some(v) = self.notification_sound { config.notification_sound = v; }
+        if let Some(v) = self.show_progress_bar { config.show_progress_bar = v; }
+        if let Some(v) = self.show_speed { config.show_speed = v; }
+        if let Some(v) = self.show_eta { config.show_eta = v; }
+        if let Some(v) = self.show_size { config.show_size = v; }
+        if let Some(v) = self.chunk_size { config.chunk_size = v; }
+        if let Some(v) = self.buffer_size { config.buffer_size = v; }
+        if let Some(v) = self.max_redirects { config.max_redirects = v; }
+        if let Some(v) = self.enable_chunked_download { config.enable_chunked_download = v; }
+        if let Some(v) = self.max_chunks_per_file { config.max_chunks_per_file = v; }
+        if let Some(v) = self.min_chunk_size { config.min_chunk_size = v; }
+        if let Some(v) = self.chunk_timeout { config.chunk_timeout = v; }
+        if let Some(v) = self.enable_resume { config.enable_resume = v; }
+        if let Some(v) = self.resume_check_interval { config.resume_check_interval = v; }
+        if let Some(v) = self.auto_resume_on_startup { config.auto_resume_on_startup = v; }
+        if let Some(v) = self.speed_limit_kb { config.speed_limit_kb = v; }
+    }
+
     pub fn parse_args() -> Result<(Self, Config), DownloadError> {
         // 解析命令行参数
         let args = Args::parse();
         
         // 加载或创建配置文件
-        let config = if Path::new(&args.config).exists() {
+        let mut config = if Path::new(&args.config).exists() {
             Config::load(&args.config).map_err(|e| DownloadError::PermissionError(format!("无法读取配置文件: {}", e)))?
         } else {
             let config = Config::default();
             config.save(&args.config).map_err(|e| DownloadError::PermissionError(format!("无法保存配置文件: {}", e)))?;
             config
         };
+
+        // 合并命令行参数
+        args.merge_into_config(&mut config);
 
         // 验证配置
         config.validate().map_err(|e| DownloadError::Unknown(format!("配置无效: {}", e)))?;

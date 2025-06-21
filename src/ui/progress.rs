@@ -5,62 +5,81 @@
 // use tokio::sync::Mutex;
 // use indicatif::ProgressBar;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::time::Instant;
 
-// 结构体：ProgressManager
-// 用于管理下载进度条
 pub struct ProgressManager {
-    multi: Arc<MultiProgress>,
-    bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
+    pub total_size: u64,
+    pub start_time: Instant,
 }
 
 impl ProgressManager {
-    // 构造函数：创建 ProgressManager 实例
-    pub fn new() -> Self {
-        ProgressManager {
-            multi: Arc::new(MultiProgress::new()),
-            bars: Arc::new(Mutex::new(HashMap::new())),
+    pub fn new(total_size: u64) -> Self {
+        Self {
+            total_size,
+            start_time: Instant::now(),
         }
     }
 
-    /// 添加一个新进度条，task_id为唯一标识，file_name为显示名
-    pub fn add_progress_bar(&self, task_id: &str, total: u64, file_name: &str) {
-        let pb = self.multi.add(ProgressBar::new(total));
-        pb.set_style(ProgressStyle::with_template(
-            "{msg:20.20} |{bar:40.cyan/blue}| {percent:>3}% {bytes:>8}/{total_bytes:<8} {binary_bytes_per_sec:>10} ETA:{eta:>8}"
-        ).unwrap()
-        .progress_chars("=>-"));
-        pb.set_message(file_name.to_string());
-        self.bars.lock().unwrap().insert(task_id.to_string(), pb);
+    /// 更新总进度，aria2c 风格输出
+    pub fn update_progress(&self, downloaded: u64, _speed: u64) {
+        let percent = if self.total_size > 0 {
+            (downloaded as f64 / self.total_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        let eta = if downloaded > 0 {
+            let elapsed = self.start_time.elapsed().as_secs();
+            let speed = downloaded as f64 / (elapsed.max(1) as f64);
+            let remain = self.total_size.saturating_sub(downloaded);
+            let eta_secs = if speed > 0.0 {
+                (remain as f64 / speed) as u64
+            } else {
+                0
+            };
+            format_time(eta_secs)
+        } else {
+            "--:--:--".to_string()
+        };
+        let speed = if self.start_time.elapsed().as_secs() > 0 {
+            downloaded as f64 / self.start_time.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let speed_str = if speed > 1024.0 * 1024.0 {
+            format!("{:.2} MiB/s", speed / 1024.0 / 1024.0)
+        } else if speed > 1024.0 {
+            format!("{:.2} KiB/s", speed / 1024.0)
+        } else {
+            format!("{:.0} B/s", speed)
+        };
+        let gid = "multidown";
+        let total_str = human_size(self.total_size);
+        let down_str = human_size(downloaded);
+        print!("\r\x1b[2K[#{} {}/{} DL:{}][{:>5.1}%] ETA:{}   ", gid, down_str, total_str, speed_str, percent, eta);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
     }
 
-    /// 更新进度，downloaded为已下载字节数，total为总字节数，speed为B/s
-    pub fn update_progress(&self, task_id: &str, downloaded: u64, total: u64, speed: u64, file_name: &str) {
-        if let Some(pb) = self.bars.lock().unwrap().get(task_id) {
-            pb.set_length(total.max(downloaded)); // 防止total为0
-            pb.set_position(downloaded);
-            pb.set_message(file_name.to_string());
-            // 自定义速度和ETA显示
-            let speed_str = if speed > 1024 * 1024 {
-                format!("{:.2} MB/s", speed as f64 / (1024.0 * 1024.0))
-            } else if speed > 1024 {
-                format!("{:.2} KB/s", speed as f64 / 1024.0)
-            } else {
-                format!("{} B/s", speed)
-            };
-            let eta_str = if speed > 0 && total > downloaded {
-                let secs = (total - downloaded) / speed;
-                let h = secs / 3600;
-                let m = (secs % 3600) / 60;
-                let s = secs % 60;
-                format!("{:02}:{:02}:{:02}", h, m, s)
-            } else {
-                "--:--:--".to_string()
-            };
-            pb.set_message(format!("{} [{}]", file_name, eta_str));
-            pb.set_prefix(format!("{}", speed_str));
-        }
+    pub fn finish(&self) {
+        println!("\n下载完成");
     }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_time(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 } 

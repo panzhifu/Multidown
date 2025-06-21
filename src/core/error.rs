@@ -1,16 +1,15 @@
 use thiserror::Error;
-use std::io;
 use actix::prelude::*;
 use anyhow;
 
 /// 下载相关错误类型
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum DownloadError {
     // ===== 网络与IO =====
     #[error("网络错误: {0}")]
-    NetworkError(#[from] reqwest::Error),
+    NetworkError(String),
     #[error("IO错误: {0}")]
-    IoError(#[from] io::Error),
+    IoError(String),
     // ===== 协议与参数 =====
     #[error("无效的URL: {0}")]
     InvalidUrl(String),
@@ -20,21 +19,27 @@ pub enum DownloadError {
     #[error("文件已存在: {0}")]
     FileExists(String),
     #[error("磁盘空间不足: 需要 {required} 字节, 可用 {available} 字节")]
+    #[allow(dead_code)]
     InsufficientSpace { required: u64, available: u64 },
     #[error("权限错误: {0}")]
     PermissionError(String),
     // ===== 下载流程 =====
     #[error("下载超时")]
+    #[allow(dead_code)]
     Timeout,
     #[error("下载被取消")]
     Cancelled,
     #[error("下载暂停")]
+    #[allow(dead_code)]
     Paused,
     #[error("重试次数超过限制: {0}")]
+    #[allow(dead_code)]
     MaxRetriesExceeded(u32),
     #[error("文件大小不匹配: 预期 {expected} 字节, 实际 {actual} 字节")]
+    #[allow(dead_code)]
     SizeMismatch { expected: u64, actual: u64 },
     #[error("校验和不匹配: 预期 {expected}, 实际 {actual}")]
+    #[allow(dead_code)]
     ChecksumMismatch { expected: String, actual: String },
     #[error("服务器错误: {0}")]
     ServerError(String),
@@ -46,6 +51,8 @@ pub enum DownloadError {
     // ===== 其它 =====
     #[error("未知错误: {0}")]
     Unknown(String),
+    #[error("续传失败: {0}")]
+    ResumeFailed(String),
 }
 
 // 兼容actix错误类型

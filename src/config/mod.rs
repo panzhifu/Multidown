@@ -14,12 +14,22 @@ pub struct Config {
     pub default_threads: usize,
     /// 默认速度限制（MB/s）
     pub default_speed_limit: f32,
+    /// 下载速度限制（KB/s），0 表示不限速
+    pub speed_limit_kb: u64,
     /// 默认输出目录
     pub default_output_dir: String,
     /// 下载重试次数
     pub retry_count: usize,
     /// 下载重试间隔（秒）
     pub retry_delay: u64,
+    /// 重试最大延迟（秒）
+    pub retry_max_delay: u64,
+    /// 重试指数退避倍数
+    pub retry_backoff_multiplier: f64,
+    /// 重试抖动因子
+    pub retry_jitter_factor: f64,
+    /// 可重试错误关键字
+    pub retryable_errors: Vec<String>,
     
     /// 网络设置
     pub timeout: u64,
@@ -53,6 +63,17 @@ pub struct Config {
     pub buffer_size: usize,
     pub max_redirects: usize,
     pub custom_headers: HashMap<String, String>,
+    
+    /// 分块下载设置
+    pub enable_chunked_download: bool,
+    pub max_chunks_per_file: usize,
+    pub min_chunk_size: usize,
+    pub chunk_timeout: u64,
+    
+    /// 断点续传设置
+    pub enable_resume: bool,
+    pub resume_check_interval: u64,
+    pub auto_resume_on_startup: bool,
 }
 
 impl Default for Config {
@@ -62,9 +83,27 @@ impl Default for Config {
             max_concurrent_downloads: 3,
             default_threads: 4,
             default_speed_limit: 10.0,
+            speed_limit_kb: 0,
             default_output_dir: "./downloads".to_string(),
             retry_count: 3,
             retry_delay: 5,
+            retry_max_delay: 60,
+            retry_backoff_multiplier: 2.0,
+            retry_jitter_factor: 0.1,
+            retryable_errors: vec![
+                "network error".to_string(),
+                "timeout".to_string(),
+                "connection reset".to_string(),
+                "temporary failure".to_string(),
+                "connection refused".to_string(),
+                "connection timeout".to_string(),
+                "dns resolution failed".to_string(),
+                "ssl error".to_string(),
+                "certificate error".to_string(),
+                "server error".to_string(),
+                "gateway timeout".to_string(),
+                "service unavailable".to_string(),
+            ],
             
             // 网络设置
             timeout: 30,
@@ -92,6 +131,17 @@ impl Default for Config {
             buffer_size: 16384,
             max_redirects: 5,
             custom_headers: HashMap::new(),
+            
+            // 分块下载设置
+            enable_chunked_download: true,
+            max_chunks_per_file: 10,
+            min_chunk_size: 1024,
+            chunk_timeout: 10,
+            
+            // 断点续传设置
+            enable_resume: true,
+            resume_check_interval: 60,
+            auto_resume_on_startup: true,
         }
     }
 }
@@ -101,7 +151,7 @@ impl Config {
     pub fn load(path: &str) -> Result<Self, DownloadError> {
         if Path::new(path).exists() {
             let content = fs::read_to_string(path)
-                .map_err(|e| DownloadError::IoError(e))?;
+                .map_err(|e| DownloadError::IoError(e.to_string()))?;
             
             // 尝试解析TOML
             match toml::from_str(&content) {
@@ -128,7 +178,7 @@ impl Config {
         if let Some(parent) = Path::new(path).parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)
-                    .map_err(|e| DownloadError::IoError(e))?;
+                    .map_err(|e| DownloadError::IoError(e.to_string()))?;
             }
         }
 
@@ -138,7 +188,7 @@ impl Config {
         
         // 写入文件
         fs::write(path, content)
-            .map_err(|e| DownloadError::IoError(e))?;
+            .map_err(|e| DownloadError::IoError(e.to_string()))?;
         
         Ok(())
     }
@@ -185,6 +235,26 @@ impl Config {
             return Err(DownloadError::Unknown("最大重定向次数必须大于0".to_string()));
         }
 
+        // 验证最大块数
+        if self.max_chunks_per_file == 0 {
+            return Err(DownloadError::Unknown("最大块数必须大于0".to_string()));
+        }
+
+        // 验证最小块大小
+        if self.min_chunk_size == 0 {
+            return Err(DownloadError::Unknown("最小块大小必须大于0".to_string()));
+        }
+
+        // 验证块超时时间
+        if self.chunk_timeout == 0 {
+            return Err(DownloadError::Unknown("块超时时间必须大于0".to_string()));
+        }
+
+        // 验证恢复检查间隔
+        if self.resume_check_interval == 0 {
+            return Err(DownloadError::Unknown("恢复检查间隔必须大于0".to_string()));
+        }
+
         // 路径校验
         if self.default_output_dir.trim().is_empty() {
             return Err(DownloadError::InvalidUrl("输出目录不能为空".to_string()));
@@ -214,9 +284,14 @@ impl Config {
         self.max_concurrent_downloads = other.max_concurrent_downloads;
         self.default_threads = other.default_threads;
         self.default_speed_limit = other.default_speed_limit;
+        self.speed_limit_kb = other.speed_limit_kb;
         self.default_output_dir = other.default_output_dir.clone();
         self.retry_count = other.retry_count;
         self.retry_delay = other.retry_delay;
+        self.retry_max_delay = other.retry_max_delay;
+        self.retry_backoff_multiplier = other.retry_backoff_multiplier;
+        self.retry_jitter_factor = other.retry_jitter_factor;
+        self.retryable_errors = other.retryable_errors.clone();
 
         // 合并网络设置
         self.timeout = other.timeout;
@@ -244,6 +319,29 @@ impl Config {
         self.buffer_size = other.buffer_size;
         self.max_redirects = other.max_redirects;
         self.custom_headers = other.custom_headers.clone();
+
+        // 合并分块下载设置
+        self.enable_chunked_download = other.enable_chunked_download;
+        self.max_chunks_per_file = other.max_chunks_per_file;
+        self.min_chunk_size = other.min_chunk_size;
+        self.chunk_timeout = other.chunk_timeout;
+
+        // 合并断点续传设置
+        self.enable_resume = other.enable_resume;
+        self.resume_check_interval = other.resume_check_interval;
+        self.auto_resume_on_startup = other.auto_resume_on_startup;
+    }
+
+    /// 生成标准化的 RetryStrategy
+    pub fn retry_strategy(&self) -> crate::core::task::retry::RetryStrategy {
+        crate::core::task::retry::RetryStrategy {
+            max_retries: self.retry_count,
+            base_delay: std::time::Duration::from_secs(self.retry_delay),
+            max_delay: std::time::Duration::from_secs(self.retry_max_delay),
+            backoff_multiplier: self.retry_backoff_multiplier,
+            jitter_factor: self.retry_jitter_factor,
+            retryable_errors: self.retryable_errors.clone(),
+        }
     }
 }
 
