@@ -20,3 +20,5 @@ Cargo.lock
 # Project specific
 /downloads/
 *.log
+
+/logs/
