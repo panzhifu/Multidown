@@ -28,17 +28,14 @@ pub struct BufferManager {
 impl BufferManager {
     /// 创建新的 BufferManager
     pub fn new(file_path: &str, buffer_size: usize) -> Result<Self, DownloadError> {
-        let file_handle = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(file_path)
-            .map_err(|e| DownloadError::IoError(e.to_string()))?;
+        let file = std::fs::File::create(file_path)
+            .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
 
         Ok(Self {
             buffer: vec![0; buffer_size],
             buffer_size,
             current_pos: 0,
-            file_handle,
+            file_handle: file,
             total_written: 0,
             flush_count: 0,
         })
@@ -70,7 +67,7 @@ impl BufferManager {
         if self.current_pos > 0 {
             self.file_handle
                 .write_all(&self.buffer[..self.current_pos])
-                .map_err(|e| DownloadError::IoError(e.to_string()))?;
+                .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
             self.total_written += self.current_pos as u64;
             self.current_pos = 0;
             self.flush_count += 1;

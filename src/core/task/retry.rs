@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crate::core::error::DownloadError;
 
 /// 重试策略
@@ -90,58 +90,88 @@ impl RetryStrategy {
 }
 
 /// 重试上下文
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct RetryContext {
-    pub strategy: RetryStrategy,
-    pub retry_count: usize,
-    pub last_error: Option<DownloadError>,
-    pub retry_history: Vec<(DownloadError, Duration)>, // 记录重试历史
-    pub total_retry_time: Duration,
+    pub max_retries: u32,
+    pub current_retries: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub last_retry_time: Option<Instant>,
 }
 
-#[allow(dead_code)]
 impl RetryContext {
-    pub fn new(strategy: RetryStrategy) -> Self {
+    pub fn new(max_retries: u32, base_delay: Duration, max_delay: Duration) -> Self {
         Self {
-            strategy,
-            retry_count: 0,
-            last_error: None,
-            retry_history: Vec::new(),
-            total_retry_time: Duration::from_secs(0),
+            max_retries,
+            current_retries: 0,
+            base_delay,
+            max_delay,
+            last_retry_time: None,
         }
     }
-    
+
+    /// 判断是否应该重试
     pub fn should_retry(&self, error: &DownloadError) -> bool {
-        self.strategy.should_retry(error, self.retry_count)
-    }
-    
-    pub fn increment_retry(&mut self, error: DownloadError) {
-        self.retry_count += 1;
-        self.last_error = Some(error.clone());
-        
-        let delay = self.strategy.get_delay(self.retry_count);
-        self.retry_history.push((error, delay));
-        self.total_retry_time += delay;
-    }
-    
-    pub fn get_delay(&self) -> Duration {
-        self.strategy.get_delay(self.retry_count)
-    }
-    
-    pub fn get_retry_stats(&self) -> RetryStats {
-        RetryStats {
-            total_retries: self.retry_count,
-            total_retry_time: self.total_retry_time,
-            retry_history: self.retry_history.clone(),
+        if self.current_retries >= self.max_retries {
+            return false;
         }
+
+        // 检查错误类型是否可重试
+        self.is_retryable_error(error)
     }
-    
+
+    /// 判断错误是否可重试
+    fn is_retryable_error(&self, error: &DownloadError) -> bool {
+        // 定义可重试的错误类型
+        static RETRYABLE_ERRORS: &[&str] = &[
+            "network error",
+            "timeout",
+            "connection reset",
+            "temporary failure",
+            "connection refused",
+            "connection timeout",
+            "dns resolution failed",
+            "ssl error",
+            "certificate error",
+            "server error",
+            "gateway timeout",
+            "service unavailable",
+        ];
+
+        let error_str = error.to_string().to_lowercase();
+        
+        // 检查错误消息是否包含可重试的错误类型
+        RETRYABLE_ERRORS.iter().any(|&retryable| {
+            error_str.contains(retryable)
+        })
+    }
+
+    /// 获取下次重试延迟
+    pub fn get_next_delay(&self) -> Duration {
+        let delay = self.base_delay * 2_u32.pow(self.current_retries);
+        delay.min(self.max_delay)
+    }
+
+    /// 记录重试
+    pub fn record_retry(&mut self) {
+        self.current_retries += 1;
+        self.last_retry_time = Some(Instant::now());
+    }
+
+    /// 重置重试计数
     pub fn reset(&mut self) {
-        self.retry_count = 0;
-        self.last_error = None;
-        self.retry_history.clear();
-        self.total_retry_time = Duration::from_secs(0);
+        self.current_retries = 0;
+        self.last_retry_time = None;
+    }
+
+    /// 获取当前重试次数
+    pub fn current_retries(&self) -> u32 {
+        self.current_retries
+    }
+
+    /// 检查是否达到最大重试次数
+    pub fn is_max_retries_reached(&self) -> bool {
+        self.current_retries >= self.max_retries
     }
 }
 
@@ -151,4 +181,43 @@ pub struct RetryStats {
     pub total_retries: usize,
     pub total_retry_time: Duration,
     pub retry_history: Vec<(DownloadError, Duration)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retry_context() {
+        let mut context = RetryContext::new(
+            3,
+            Duration::from_secs(1),
+            Duration::from_secs(10)
+        );
+
+        // 测试初始状态
+        assert_eq!(context.current_retries(), 0);
+        assert!(!context.is_max_retries_reached());
+
+        // 测试重试记录
+        context.record_retry();
+        assert_eq!(context.current_retries(), 1);
+
+        // 测试重置
+        context.reset();
+        assert_eq!(context.current_retries(), 0);
+    }
+
+    #[test]
+    fn test_retryable_errors() {
+        let context = RetryContext::new(3, Duration::from_secs(1), Duration::from_secs(10));
+
+        // 测试可重试的错误
+        let retryable_error = DownloadError::network_error("network error occurred");
+        assert!(context.should_retry(&retryable_error));
+
+        // 测试不可重试的错误
+        let non_retryable_error = DownloadError::invalid_url("invalid url");
+        assert!(!context.should_retry(&non_retryable_error));
+    }
 } 

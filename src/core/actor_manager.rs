@@ -243,7 +243,11 @@ impl DownloadManagerActor {
             completed: 0,
             failed: 0,
             paused: 0,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            speed: 0,
         };
+        let mut total_speed = 0u64;
         for meta in self.metas.values() {
             match meta.status {
                 TaskStatus::Running => stats.running += 1,
@@ -252,7 +256,13 @@ impl DownloadManagerActor {
                 TaskStatus::Paused => stats.paused += 1,
                 _ => {}
             }
+            stats.total_bytes += meta.total;
+            stats.downloaded_bytes += meta.downloaded;
+            // 这里假设 meta.progress 代表当前速度（需任务actor定期更新）
+            // 可根据实际情况调整
+            total_speed += meta.progress as u64; // 临时用progress字段模拟速度
         }
+        stats.speed = total_speed; // 真实实现应由任务actor定期上报速度
         stats
     }
 
@@ -260,11 +270,11 @@ impl DownloadManagerActor {
     #[allow(dead_code)]
     pub fn save_resume_info(&self, resume_info: &ResumeInfo) -> Result<(), DownloadError> {
         let path = format!("downloads/resume_{}.json", resume_info.task_id);
-        let json = serde_json::to_string_pretty(resume_info)
-            .map_err(|e| DownloadError::Unknown(format!("序列化失败: {}", e)))?;
+        let json = serde_json::to_string_pretty(&resume_info)
+            .map_err(|e| DownloadError::Unknown(format!("序列化失败: {}", e).into()))?;
         
         std::fs::write(path, json)
-            .map_err(|e| DownloadError::IoError(e.to_string()))?;
+            .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
         Ok(())
     }
     
@@ -375,6 +385,9 @@ pub struct TaskStats {
     pub completed: usize,
     pub failed: usize,
     pub paused: usize,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub speed: u64, // B/s
 }
 
 impl Actor for DownloadManagerActor {

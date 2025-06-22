@@ -1,6 +1,6 @@
 [package]
 name = "multidown"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["panzhifu"]
 description = "一个用 Rust 编写的多线程下载管理器"

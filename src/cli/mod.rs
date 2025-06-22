@@ -1,195 +1,189 @@
+//! CLI: 命令行接口和参数解析模块
+//! 
+//! ## 主要功能
+//! 
+//! - 命令行参数解析和验证
+//! - 配置文件路径管理
+//! - URL 列表处理（命令行参数和文件）
+//! - 平台特定的路径处理
+//! - 配置文件编辑器集成
+//! 
+//! ## 支持的命令
+//! 
+//! - 基本下载：`multidown <url>`
+//! - 批量下载：`multidown -f urls.txt`
+//! - 编辑配置：`multidown -e`
+//! - 指定配置：`multidown -c config.conf <url>`
+//! - 速度限制：`multidown -l 1024 <url>`
+//! 
+//! ## 平台支持
+//! 
+//! - Windows: `%APPDATA%/multidown/multidown.conf`
+//! - macOS: `~/Library/Application Support/multidown/multidown.conf`
+//! - Linux: `~/.config/multidown/multidown.conf`
+
 use clap::Parser;
 use std::fs;
 use crate::config::Config;
 use actix::prelude::*;
 use crate::core::error::DownloadError;
 use std::path::Path;
+use std::env;
+use std::borrow::Cow;
 
+/// 获取平台默认配置文件路径
+pub fn default_config_path() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        format!("{}/multidown/multidown.conf", appdata)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/Library/Application Support/multidown/multidown.conf", home)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/.config/multidown/multidown.conf", home)
+    }
+}
+
+/// 打开配置文件编辑器
+pub fn open_config_in_editor(config_path: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("notepad").arg(config_path).status().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-e").arg(config_path).status().ok();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 优先 xdg-open，否则 nano
+        if std::process::Command::new("xdg-open").arg(config_path).status().is_err() {
+            let _ = std::process::Command::new("nano").arg(config_path).status();
+        }
+    }
+}
+
+/// 获取平台默认下载目录（当前工作目录）
+fn get_default_download_dir() -> String {
+    std::env::current_dir() // 获取当前工作目录
+        .map(|p| p.display().to_string()) // .map是Option的迭代器方法，将Option转换为String
+        .unwrap_or_else(|_| ".".to_string()) // 如果获取失败，返回"."，即当前目录，保证返回值不为空
+}
+
+/// MultiDown 命令行参数
+/// 
+/// 示例用法：
+///   multidown https://example.com/file.zip
+///   multidown -e  # 编辑配置文件
+///   multidown -c /path/to/config.conf https://example.com/file.zip
+///   multidown -l 1000 https://example.com/file.zip
+///
+/// 更多用法请加 --help 查看
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "multidown",
     author = "panzhifu",
     version = env!("CARGO_PKG_VERSION"),
     about = "一个用 Rust 编写的多线程下载管理器",
-    long_about = "支持并发下载、断点续传、动态分片调整和实时进度显示的多线程下载管理器"
+    long_about = "支持并发下载、断点续传、动态分片调整和实时进度显示的多线程下载管理器。\n\n示例：\n  multidown https://example.com/file.zip\n  multidown -e\n  multidown -c /path/to/config.conf https://example.com/file.zip\n  multidown --speed-limit-kb 1000 https://example.com/file.zip\n"
 )]
 pub struct Args {
-    /// 要下载的URL列表
-    #[arg(required = false)]
+    /// 要下载的URL列表（可同时指定多个）
+    #[arg(required = false, help = "要下载的URL列表，可以同时指定多个URL。")]
     pub urls: Vec<String>,
 
     /// 包含URL列表的文件路径
-    #[arg(short, long)]
+    #[arg(short, long, help = "包含URL列表的文件路径，每行一个URL。")]
     pub file: Option<String>,
 
-    /// 配置文件路径
-    #[arg(short, long, default_value = "./multidown.conf")]
+    /// 配置文件路径，默认为平台推荐路径
+    #[arg(short = 'c', long, default_value_t = default_config_path(), help = "配置文件路径，默认为平台推荐路径。")]
     pub config: String,
 
-    // ========== 可覆盖 Config 的参数 ==========
-    #[arg(long)]
-    pub max_concurrent_downloads: Option<usize>,
-    #[arg(long)]
-    pub default_threads: Option<usize>,
-    #[arg(long)]
-    pub default_speed_limit: Option<f32>,
-    #[arg(long)]
-    pub output_dir: Option<String>,
-    #[arg(long)]
-    pub retry_count: Option<usize>,
-    #[arg(long)]
-    pub retry_delay: Option<u64>,
-    #[arg(long)]
-    pub timeout: Option<u64>,
-    #[arg(long)]
-    pub user_agent: Option<String>,
-    #[arg(long)]
-    pub proxy: Option<String>,
-    #[arg(long)]
-    pub verify_ssl: Option<bool>,
-    #[arg(long)]
-    pub auto_rename: Option<bool>,
-    #[arg(long)]
-    pub overwrite_existing: Option<bool>,
-    #[arg(long)]
-    pub create_directories: Option<bool>,
-    #[arg(long)]
-    pub enable_notifications: Option<bool>,
-    #[arg(long)]
-    pub notification_sound: Option<bool>,
-    #[arg(long)]
-    pub show_progress_bar: Option<bool>,
-    #[arg(long)]
-    pub show_speed: Option<bool>,
-    #[arg(long)]
-    pub show_eta: Option<bool>,
-    #[arg(long)]
-    pub show_size: Option<bool>,
-    #[arg(long)]
-    pub chunk_size: Option<usize>,
-    #[arg(long)]
-    pub buffer_size: Option<usize>,
-    #[arg(long)]
-    pub max_redirects: Option<usize>,
-    #[arg(long)]
-    pub enable_chunked_download: Option<bool>,
-    #[arg(long)]
-    pub max_chunks_per_file: Option<usize>,
-    #[arg(long)]
-    pub min_chunk_size: Option<usize>,
-    #[arg(long)]
-    pub chunk_timeout: Option<u64>,
-    #[arg(long)]
-    pub enable_resume: Option<bool>,
-    #[arg(long)]
-    pub resume_check_interval: Option<u64>,
-    #[arg(long)]
-    pub auto_resume_on_startup: Option<bool>,
+    /// 编辑配置文件（-e 或 --edit）
+    #[arg(short = 'e', long = "edit", help = "用系统默认编辑器打开配置文件并退出。")]
+    pub edit_config: bool,
+
     /// 下载速度限制（KB/s），0 表示不限速
-    #[arg(long)]
+    #[arg(long, short = 'l', help = "下载速度限制（KB/s），0 表示不限速。")]
     pub speed_limit_kb: Option<u64>,
+
+    /// 指定下载目录（默认：当前工作目录）
+    #[arg(long, short = 'd', default_value_t = get_default_download_dir(), help = "指定下载目录，覆盖配置文件中的设置，默认当前工作目录。")]
+    pub download_dir: String,
+
+    /// 指定下载文件名
+    #[arg(long, short = 'n', help = "指定下载文件名，覆盖URL自动推断。")]
+    pub file_name: Option<String>,
+
+    /// 指定下载线程数
+    #[arg(long, short = 't', help = "指定下载线程数，覆盖配置文件中的设置。")]
+    pub thread_count: Option<usize>,
+
 }
 
 impl Args {
-    /// 显示版本信息
-    pub fn show_version() {
-        println!("MultiDown v{}", env!("CARGO_PKG_VERSION"));
-        
-        // 尝试显示构建时间（如果可用）
-        if let Ok(timestamp) = std::env::var("VERGEN_BUILD_TIMESTAMP") {
-            println!("构建时间: {}", timestamp);
-        }
-        
-        // 尝试显示Git提交（如果可用）
-        if let Ok(git_sha) = std::env::var("VERGEN_GIT_SHA_SHORT") {
-            println!("Git提交: {}", git_sha);
-        }
-        
-        // 显示目标平台
-        if let Ok(target) = std::env::var("TARGET") {
-            println!("目标平台: {}", target);
-        }
-        if let Ok(rust_version) = std::env::var("RUST_VERSION") {
-            println!("Rust版本: {}", rust_version);
-        }
-    }
-
-    /// 合并命令行参数到配置
-    pub fn merge_into_config(&self, config: &mut Config) {
-        if let Some(v) = self.max_concurrent_downloads { config.max_concurrent_downloads = v; }
-        if let Some(v) = self.default_threads { config.default_threads = v; }
-        if let Some(v) = self.default_speed_limit { config.default_speed_limit = v; }
-        if let Some(ref v) = self.output_dir { config.default_output_dir = v.clone(); }
-        if let Some(v) = self.retry_count { config.retry_count = v; }
-        if let Some(v) = self.retry_delay { config.retry_delay = v; }
-        if let Some(v) = self.timeout { config.timeout = v; }
-        if let Some(ref v) = self.user_agent { config.user_agent = v.clone(); }
-        if let Some(ref v) = self.proxy { config.proxy = Some(v.clone()); }
-        if let Some(v) = self.verify_ssl { config.verify_ssl = v; }
-        if let Some(v) = self.auto_rename { config.auto_rename = v; }
-        if let Some(v) = self.overwrite_existing { config.overwrite_existing = v; }
-        if let Some(v) = self.create_directories { config.create_directories = v; }
-        if let Some(v) = self.enable_notifications { config.enable_notifications = v; }
-        if let Some(v) = self.notification_sound { config.notification_sound = v; }
-        if let Some(v) = self.show_progress_bar { config.show_progress_bar = v; }
-        if let Some(v) = self.show_speed { config.show_speed = v; }
-        if let Some(v) = self.show_eta { config.show_eta = v; }
-        if let Some(v) = self.show_size { config.show_size = v; }
-        if let Some(v) = self.chunk_size { config.chunk_size = v; }
-        if let Some(v) = self.buffer_size { config.buffer_size = v; }
-        if let Some(v) = self.max_redirects { config.max_redirects = v; }
-        if let Some(v) = self.enable_chunked_download { config.enable_chunked_download = v; }
-        if let Some(v) = self.max_chunks_per_file { config.max_chunks_per_file = v; }
-        if let Some(v) = self.min_chunk_size { config.min_chunk_size = v; }
-        if let Some(v) = self.chunk_timeout { config.chunk_timeout = v; }
-        if let Some(v) = self.enable_resume { config.enable_resume = v; }
-        if let Some(v) = self.resume_check_interval { config.resume_check_interval = v; }
-        if let Some(v) = self.auto_resume_on_startup { config.auto_resume_on_startup = v; }
-        if let Some(v) = self.speed_limit_kb { config.speed_limit_kb = v; }
-    }
-
-    pub fn parse_args() -> Result<(Self, Config), DownloadError> {
-        // 解析命令行参数
+    pub fn parse_args() -> Result<(Self, Config), DownloadError> { 
+        // 解析命令行参数，并返回配置文件路径和配置，DownloadError是自定义错误类型
         let args = Args::parse();
         
+        // --edit-config 逻辑
+        if args.edit_config {
+            open_config_in_editor(&args.config);
+            std::process::exit(0); // 退出程序
+        }
+
         // 加载或创建配置文件
         let mut config = if Path::new(&args.config).exists() {
-            Config::load(&args.config).map_err(|e| DownloadError::PermissionError(format!("无法读取配置文件: {}", e)))?
+            Config::load(&args.config).map_err(|e| DownloadError::permission_error(format!("无法读取配置文件: {}", e)))?
         } else {
+            // 确保配置文件所在目录存在
+            if let Some(parent) = Path::new(&args.config).parent() { 
+                // .parent() 返回父目录路径，如果存在
+                std::fs::create_dir_all(parent).map_err(|e| DownloadError::permission_error(format!("无法创建配置目录: {}", e)))?;
+            }
+            
             let config = Config::default();
-            config.save(&args.config).map_err(|e| DownloadError::PermissionError(format!("无法保存配置文件: {}", e)))?;
-            config
+            config.save_with_tutorial(&args.config).map_err(|e| DownloadError::permission_error(format!("无法保存配置文件: {}", e)))?;
+            config // 返回默认配置
         };
 
-        // 合并命令行参数
-        args.merge_into_config(&mut config);
+        // 合并命令行参数到配置
+        config.merge_from_args(&args);
 
         // 验证配置
-        config.validate().map_err(|e| DownloadError::Unknown(format!("配置无效: {}", e)))?;
+        config.validate().map_err(|e| DownloadError::unknown(format!("配置无效: {}", e)))?;
 
         Ok((args, config))
     }
 
+    // 定义从文件中读取URL的方法
     pub fn get_urls(&self) -> Result<Vec<String>, DownloadError> {
-        let mut urls = Vec::new();
+        let mut urls = Vec::new(); // vec是一个动态数组，可以存储任意类型的元素
 
         // 如果提供了URL列表，添加到结果中
-        urls.extend(self.urls.clone());
+        urls.extend_from_slice(&self.urls); // extend_from_slice方法将切片中的元素添加到vec中，不使用clone提升性能
 
         // 如果提供了文件，从文件中读取URL
         if let Some(file_path) = &self.file {
             if !Path::new(file_path).exists() {
-                return Err(DownloadError::FileExists(file_path.clone()));
+                return Err(DownloadError::file_exists(file_path.to_string()));
             }
             let content = fs::read_to_string(file_path)
-                .map_err(|e| DownloadError::PermissionError(format!("无法读取URL文件: {}", e)))?;
+                .map_err(|e| DownloadError::permission_error(std::borrow::Cow::Owned(format!("无法读取URL文件: {}", e))))?;
             
             // 按行读取URL，忽略空行和注释
             for line in content.lines() {
                 let line = line.trim();
                 if !line.is_empty() && !line.starts_with('#') {
                     if !crate::utils::validator::is_valid_url(line) {
-                        return Err(DownloadError::InvalidUrl(line.to_string()));
+                        return Err(DownloadError::invalid_url(line.to_string()));
                     }
                     urls.push(line.to_string());
                 }
@@ -198,7 +192,7 @@ impl Args {
 
         // 验证URL列表不为空
         if urls.is_empty() {
-            return Err(DownloadError::InvalidUrl("未提供任何URL。请通过命令行参数或文件提供至少一个URL。".to_string()));
+            return Err(DownloadError::invalid_url(Cow::Borrowed("未提供任何URL。请通过命令行参数或文件提供至少一个URL。")));
         }
 
         Ok(urls)
@@ -216,9 +210,11 @@ pub struct GetUrls(pub Args);
 impl Message for GetUrls { type Result = Result<Vec<String>, DownloadError>; }
 
 /// CLI参数解析Actor
+/// CLI 是Command Line Interface 的缩写，表示命令行界面。
 pub struct CliActor;
 impl Actor for CliActor { type Context = actix::Context<Self>; }
 
+// 实现Handler trait，用于处理消息，用于ParseArgs消息
 impl Handler<ParseArgs> for CliActor {
     type Result = MessageResult<ParseArgs>;
     fn handle(&mut self, _msg: ParseArgs, _ctx: &mut Self::Context) -> Self::Result {
@@ -226,6 +222,7 @@ impl Handler<ParseArgs> for CliActor {
     }
 }
 
+// 实现Handler trait，用于处理消息，用于GetUrls消息
 impl Handler<GetUrls> for CliActor {
     type Result = MessageResult<GetUrls>;
     fn handle(&mut self, msg: GetUrls, _ctx: &mut Self::Context) -> Self::Result {
@@ -251,7 +248,7 @@ mod tests {
         // 创建临时配置文件
         let temp_config = "temp_config.conf";
         let config = Config::default();
-        config.save(temp_config).unwrap();
+        config.save_with_tutorial(temp_config).unwrap();
 
         // 测试加载配置
         let args = vec!["multidown", "-c", temp_config, "https://example.com/file.zip"];

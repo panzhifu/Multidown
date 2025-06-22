@@ -1,10 +1,12 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use std::borrow::Cow;
 
 use crate::core::error::DownloadError;
 use crate::core::actor_manager::ResumeInfo;
-use super::retry::{RetryContext, RetryStrategy, RetryStats};
+use super::retry::{RetryContext, RetryStats};
 use super::util::FileInfo;
 
 use actix::{Context, AsyncContext};
@@ -79,7 +81,7 @@ impl ChunkedDownloadManager {
             completed_chunks: Arc::new(Mutex::new(Vec::new())),
             failed_chunks: Arc::new(Mutex::new(Vec::new())),
             max_concurrent_chunks: 3, // 默认最大并发块数
-            retry_context: RetryContext::new(RetryStrategy::default()),
+            retry_context: RetryContext::new(3, Duration::from_secs(1), Duration::from_secs(60)),
         }
     }
     
@@ -99,8 +101,8 @@ impl ChunkedDownloadManager {
         
         // 先收集可用的块索引
         let mut available_indices = Vec::new();
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if !chunk.completed && !self.is_chunk_active(i) && !self.is_chunk_failed(i) {
+        for (i, _chunk) in self.chunks.iter().enumerate() {
+            if !_chunk.completed && !self.is_chunk_active(i) && !self.is_chunk_failed(i) {
                 available_indices.push(i);
             }
         }
@@ -172,7 +174,7 @@ impl ChunkedDownloadManager {
         let mut retry_chunks = Vec::new();
         
         for chunk_index in failed_chunks {
-            if self.retry_context.should_retry(&DownloadError::Unknown("chunk_download_failed".to_string())) {
+            if self.retry_context.should_retry(&DownloadError::Unknown(Cow::Borrowed("chunk_download_failed"))) {
                 retry_chunks.push(chunk_index);
             }
         }
@@ -226,15 +228,15 @@ impl ChunkedDownloadManager {
     
     pub fn merge_chunks(&self, output_path: &str) -> Result<(), DownloadError> {
         let mut output_file = std::fs::File::create(output_path)
-            .map_err(|e| DownloadError::IoError(e.to_string()))?;
+            .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
         
-        for (i, chunk) in self.chunks.iter().enumerate() {
+        for (i, _chunk) in self.chunks.iter().enumerate() {
             let chunk_path = self.get_chunk_file_path(i);
             if let Ok(mut chunk_file) = std::fs::File::open(&chunk_path) {
                 std::io::copy(&mut chunk_file, &mut output_file)
-                    .map_err(|e| DownloadError::IoError(e.to_string()))?;
+                    .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
             } else {
-                return Err(DownloadError::Unknown(format!("无法打开块文件: {}", chunk_path)));
+                return Err(DownloadError::Unknown(format!("无法打开块文件: {}", chunk_path).into()));
             }
         }
         
@@ -266,10 +268,10 @@ impl ChunkedDownloadManager {
         
         let path = format!("downloads/resume_{}.json", task_id);
         let json = serde_json::to_string_pretty(&resume_info)
-            .map_err(|e| DownloadError::Unknown(format!("序列化失败: {}", e)))?;
+            .map_err(|e| DownloadError::Unknown(format!("序列化失败: {}", e).into()))?;
         
         std::fs::write(path, json)
-            .map_err(|e| DownloadError::IoError(e.to_string()))?;
+            .map_err(|e| DownloadError::IoError(e.to_string().into()))?;
         Ok(())
     }
     
@@ -281,24 +283,31 @@ impl ChunkedDownloadManager {
         };
         
         let resume_info: ResumeInfo = serde_json::from_str(&content)
-            .map_err(|e| DownloadError::Unknown(format!("反序列化失败: {}", e)))?;
+            .map_err(|e| DownloadError::Unknown(format!("反序列化失败: {}", e).into()))?;
 
         // --- VALIDATION LOGIC ---
         // 1. ETag check (primary)
-        if let (Some(old_etag), Some(new_etag)) = (&resume_info.etag, &current_file_info.etag) {
-            if old_etag != new_etag {
-                return Err(DownloadError::ResumeFailed("ETag mismatch, file has changed.".to_string()));
+        if let Some(etag) = &current_file_info.etag {
+            if let Some(resume_etag) = &resume_info.etag {
+                if etag != resume_etag {
+                    return Err(DownloadError::ResumeFailed(Cow::Borrowed("ETag mismatch, file has changed.")));
+                }
             }
         }
+
         // 2. Last-Modified check (fallback)
-        else if let (Some(old_lm), Some(new_lm)) = (&resume_info.last_modified, &current_file_info.last_modified) {
-             if old_lm != new_lm {
-                return Err(DownloadError::ResumeFailed("Last-Modified mismatch, file has changed.".to_string()));
+        if let Some(last_modified) = &current_file_info.last_modified {
+            if let Some(resume_last_modified) = &resume_info.last_modified {
+                if last_modified != resume_last_modified {
+                    return Err(DownloadError::ResumeFailed(Cow::Borrowed("Last-Modified mismatch, file has changed.")));
+                }
             }
         }
+
         // If one has info and the other doesn't, it's ambiguous. Let's be strict.
-        else if resume_info.etag.is_some() != current_file_info.etag.is_some() || resume_info.last_modified.is_some() != current_file_info.last_modified.is_some() {
-             return Err(DownloadError::ResumeFailed("Inconsistent resume headers (ETag/Last-Modified).".to_string()));
+        if current_file_info.etag.is_some() && current_file_info.last_modified.is_some() && 
+           resume_info.etag.is_none() && resume_info.last_modified.is_none() {
+            return Err(DownloadError::ResumeFailed(Cow::Borrowed("Inconsistent resume headers (ETag/Last-Modified).")));
         }
 
         // --- RESTORE STATE ---
@@ -347,12 +356,16 @@ impl ChunkedDownloadManager {
     /// 检查是否需要重试
     pub fn should_retry_failed_chunks(&self) -> bool {
         let failed_count = self.failed_chunks.lock().unwrap().len();
-        failed_count > 0 && self.retry_context.retry_count < self.retry_context.strategy.max_retries
+        failed_count > 0 && !self.retry_context.is_max_retries_reached()
     }
     
     /// 获取重试统计信息
     pub fn get_retry_stats(&self) -> RetryStats {
-        self.retry_context.get_retry_stats()
+        RetryStats {
+            total_retries: self.retry_context.current_retries() as usize,
+            total_retry_time: Duration::from_secs(0), // 简化实现
+            retry_history: Vec::new(), // 简化实现
+        }
     }
     
     /// 重置重试状态

@@ -147,7 +147,7 @@ impl DownloadTaskActor {
     pub fn schedule_retry_failed_chunks(&mut self, ctx: &mut Context<Self>) {
         if let Some(chunk_manager) = &mut self.chunk_manager {
             if chunk_manager.should_retry_failed_chunks() {
-                let delay = chunk_manager.retry_context.get_delay();
+                let delay = chunk_manager.retry_context.get_next_delay();
                 ctx.run_later(delay, move |act, ctx| {
                     if let Some(chunk_manager) = &mut act.chunk_manager {
                         chunk_manager.retry_failed_chunks(ctx, &act.url, &act.file, act.id);
@@ -166,7 +166,7 @@ impl DownloadTaskActor {
             if stats.failed_chunks == stats.total_chunks && !should_retry {
                 let retry_stats = chunk_manager.get_retry_stats();
                 println!("[chunked_download] 所有块都失败了，重试统计: {:?}", retry_stats);
-                self.notify_manager_failed(DownloadError::Unknown("所有块下载失败".to_string()));
+                self.notify_manager_failed(DownloadError::Unknown(std::borrow::Cow::Borrowed("所有块下载失败")));
                 return;
             }
             

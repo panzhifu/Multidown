@@ -14,10 +14,10 @@ use super::util::FileInfo;
 async fn get_file_info(url: &str) -> Result<FileInfo, DownloadError> {
     let client = awc::Client::default();
     let response = client.head(url).send().await
-        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e)))?;
+        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e).into()))?;
     
     if !response.status().is_success() {
-        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status())));
+        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status()).into()));
     }
     
     Ok(FileInfo {
@@ -55,11 +55,11 @@ impl Handler<StartTask> for DownloadTaskActor {
         
         actix::spawn(async move {
             if !crate::utils::validator::is_valid_url(&url) {
-                actor_addr.do_send(MarkFailed { error: DownloadError::InvalidUrl(url.clone()) });
+                actor_addr.do_send(MarkFailed { error: DownloadError::InvalidUrl(url.clone().into()) });
                 return;
             }
             if Path::new(&file).exists() {
-                actor_addr.do_send(MarkFailed { error: DownloadError::FileExists(file.clone()) });
+                actor_addr.do_send(MarkFailed { error: DownloadError::FileExists(file.clone().into()) });
                 return;
             }
             
@@ -194,7 +194,11 @@ impl Handler<DownloadChunkMsg> for DownloadTaskActor {
             if is_paused.load(Ordering::SeqCst) {
                 return Err(DownloadError::Paused);
             }
-            let mut retry_context = super::retry::RetryContext::new(config.retry_strategy());
+            let mut retry_context = super::retry::RetryContext::new(
+                config.retry_count as u32,
+                std::time::Duration::from_secs(config.retry_delay),
+                std::time::Duration::from_secs(config.retry_max_delay)
+            );
             loop {
                 if is_paused.load(Ordering::SeqCst) {
                     return Err(DownloadError::Paused);
@@ -203,8 +207,8 @@ impl Handler<DownloadChunkMsg> for DownloadTaskActor {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         if retry_context.should_retry(&e) {
-                            retry_context.increment_retry(e);
-                            tokio::time::sleep(retry_context.get_delay()).await;
+                            retry_context.record_retry();
+                            tokio::time::sleep(retry_context.get_next_delay()).await;
                         } else {
                             return Err(e);
                         }

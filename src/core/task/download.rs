@@ -2,6 +2,7 @@ use actix::Addr;
 use futures::StreamExt;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
 
 use crate::config::Config;
 use crate::core::error::DownloadError;
@@ -22,7 +23,11 @@ pub async fn start_single_download_with_retry(
     let error_addr = actor_addr.clone();
     
     // 创建重试上下文
-    let mut retry_context = RetryContext::new(config.retry_strategy());
+    let mut retry_context = RetryContext::new(
+        config.retry_count as u32,
+        std::time::Duration::from_secs(config.retry_delay),
+        std::time::Duration::from_secs(config.retry_max_delay)
+    );
     
     // 在单独的线程中运行 awc 下载
     let handle = std::thread::spawn(move || {
@@ -42,9 +47,9 @@ pub async fn start_single_download_with_retry(
                         println!("[actor_task] 单线程下载失败: {:?}", error);
                         log::error!("单线程下载失败: {:?}", error);
                         if retry_context.should_retry(&error) {
-                            retry_context.increment_retry(error.clone());
-                            let delay = retry_context.get_delay();
-                            println!("[actor_task] 将在 {} 秒后重试下载 (第 {} 次重试)", delay.as_secs(), retry_context.retry_count);
+                            retry_context.record_retry();
+                            let delay = retry_context.get_next_delay();
+                            println!("[actor_task] 将在 {} 秒后重试下载 (第 {} 次重试)", delay.as_secs(), retry_context.current_retries());
                             tokio::time::sleep(delay).await;
                         } else {
                             actor_addr.do_send(MarkFailed { error });
@@ -60,7 +65,7 @@ pub async fn start_single_download_with_retry(
     if let Err(e) = handle.join() {
         println!("[actor_task] 下载线程异常: {:?}", e);
         log::error!("下载线程异常: {:?}", e);
-        error_addr.do_send(MarkFailed { error: DownloadError::Unknown("下载线程异常".to_string()) });
+        error_addr.do_send(MarkFailed { error: DownloadError::Unknown(Cow::Borrowed("下载线程异常")) });
     }
 }
 
@@ -73,10 +78,10 @@ async fn perform_single_download(
 ) -> Result<(), DownloadError> {
     let client = awc::Client::default();
     let mut response = client.get(url).send().await
-        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e)))?;
+        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e).into()))?;
     
     if !response.status().is_success() {
-        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status())));
+        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status()).into()));
     }
     
     let total = response.headers().get("content-length")
@@ -116,7 +121,7 @@ async fn perform_single_download(
             Err(e) => {
                 println!("[download] 网络流错误: {:?}", e);
                 log::error!("网络流错误: {:?}", e);
-                return Err(DownloadError::Unknown(format!("网络流错误: {:?}", e)));
+                return Err(DownloadError::Unknown(format!("网络流错误: {:?}", e).into()));
             }
         }
     }
@@ -149,10 +154,10 @@ pub async fn perform_chunk_download(
         .insert_header(("Range", range_header))
         .send()
         .await
-        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e)))?;
+        .map_err(|e| DownloadError::NetworkError(format!("{:?}", e).into()))?;
     
     if !response.status().is_success() && response.status() != 206 {
-        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status())));
+        return Err(DownloadError::ServerError(format!("服务器错误: {}", response.status()).into()));
     }
     
     let chunk_path = format!("downloads/temp/{}/chunk_{:04}", 
@@ -173,7 +178,7 @@ pub async fn perform_chunk_download(
                 }
                 buffer_manager.write(bytes.as_ref())?;
             }
-            Err(e) => return Err(DownloadError::Unknown(format!("网络流错误: {:?}", e))),
+            Err(e) => return Err(DownloadError::Unknown(format!("网络流错误: {:?}", e).into())),
         }
     }
     
